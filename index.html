@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prince of Persia (remake)</title>
+<style>
+  html,body{margin:0;height:100%;background:#07060d;color:#cbb98a;font-family:monospace}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+  canvas{width:min(96vw,calc(92vh*640/372));image-rendering:pixelated;background:#000;border:2px solid #3a3150}
+  p{margin:0;font-size:13px;text-align:center;line-height:1.5;padding:0 12px}
+  b{color:#ffd86a}
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="372"></canvas>
+<p><b>←/→</b> run &nbsp; <b>↑</b> jump (hold ↑ in the air to grab ledges, ↑ again to climb) &nbsp; <b>↓</b> drop from ledge / crouch / block<br>
+<b>Space</b> sword strike (when a guard is near) &nbsp; <b>Enter</b> start / restart &nbsp; (WASD works too)</p>
+<script>
+'use strict';
+// ---------------------------------------------------------------- constants
+const TW = 64, TH = 110;            // tile width / height (px)
+const COLS = 30, ROWS = 6;          // level size in tiles
+const RW = 10, RH = 3;              // one "room" = 10 x 3 tiles (screen)
+const W = 640, H = 372, VIEW_H = 340;
+const G = 0.45;                     // gravity
+const START_TIME = 60 * 60;         // 60 minutes, in seconds
+
+// Legend: . empty  # wall block  = floor  ^ spikes  p pressure plate (opens gate)
+//         D gate   E exit door   k potion   G guard   S prince start
+// A floor tile's walking surface is the BOTTOM edge of its cell; '#' is walkable on top.
+const LEVEL = [
+  '##############################',
+  '.........#....................',
+  '.........#E=k=^==.===G===.....',
+  '#################.######.=..##',
+  '..........................=...',
+  '=S=====^==k=p===D=====G=======',
+];
+const FLOORISH = '=^pEkGSD';
+
+// ---------------------------------------------------------------- state
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let grid, items, guards, player, gateOpen, start;
+let game = 'title';                 // title | play | dead | won | timeout
+let timeLeft = START_TIME, frame = 0, msg = '', msgT = 0, sparks = [];
+const keys = {}; let pressed = {};
+
+function reset(newGame) {
+  if (newGame) timeLeft = START_TIME;
+  grid = LEVEL.map(r => r.padEnd(COLS, '.').split(''));
+  items = []; guards = []; gateOpen = false;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const ch = grid[r][c], x = c * TW + TW / 2, y = (r + 1) * TH;
+    if (ch === 'S') { start = { x, y }; grid[r][c] = '='; }
+    if (ch === 'G') { guards.push(newGuard(x, y)); grid[r][c] = '='; }
+    if (ch === 'k') { items.push({ x, y, taken: false }); grid[r][c] = '='; }
+  }
+  player = { x: start.x, y: start.y, vx: 0, vy: 0, dir: 1, state: 'ground', hp: 3, maxhp: 3,
+    phase: 0, minY: start.y, atkT: 0, blk: false, hurtT: 0, climbT: 0, hangT: 0, noGrab: 0,
+    crouch: false, run: false, fight: false };
+  say('Find the exit. Beware of spikes, gates and guards.', 240);
+}
+function newGuard(x, y) {
+  return { x, y, dir: -1, hp: 3, alive: true, state: 'ground', atkT: 0, blkT: 0, cd: 60,
+    hurtT: 0, phase: 0, engaged: false, run: false };
+}
+function say(t, n) { msg = t; msgT = n || 150; }
+
+// ---------------------------------------------------------------- tile helpers
+function cell(c, r) {
+  if (c < 0 || c >= COLS) return '#';
+  if (r < 0 || r >= ROWS) return '.';
+  return grid[r][c];
+}
+function isWallCell(c, r) { const ch = cell(c, r); return ch === '#' || (ch === 'D' && !gateOpen); }
+function isWall(px, py) { return isWallCell(Math.floor(px / TW), Math.floor(py / TH)); }
+function surf(c, r) {
+  const ch = cell(c, r);
+  if (ch === '#') return r * TH;
+  if (FLOORISH.includes(ch)) return (r + 1) * TH;
+  return null;
+}
+// find a walkable surface in column of x whose height lies within [y0, y1]
+function findFloor(x, y0, y1) {
+  const c = Math.floor(x / TW);
+  for (let r = Math.max(0, Math.floor(y0 / TH) - 1); r <= Math.min(ROWS - 1, Math.floor(y1 / TH)); r++) {
+    const s = surf(c, r);
+    if (s !== null && s >= y0 - 0.01 && s <= y1 + 0.01) return { s, ch: cell(c, r), c, r };
+  }
+  return null;
+}
+function moveX(e, dx) {
+  const nx = e.x + dx, side = dx > 0 ? 12 : -12;
+  if (isWall(nx + side, e.y - 5) || isWall(nx + side, e.y - 60)) return false;
+  e.x = nx; return true;
+}
+
+// ---------------------------------------------------------------- audio
+let actx = null;
+function beep(f, d, type, vol) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square'; o.frequency.value = f; g.gain.value = vol || 0.04;
+    o.connect(g); g.connect(actx.destination); o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + d); o.stop(actx.currentTime + d);
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------- player logic
+function die(why) {
+  if (player.state === 'dead') return;
+  player.state = 'dead'; game = 'dead'; say(why, 9999); beep(90, .6, 'sawtooth', .08);
+}
+function hurt(n) {
+  player.hp -= n; player.hurtT = 40; beep(160, .2, 'sawtooth', .07);
+  if (player.hp <= 0) die('You were slain!  Press Enter');
+}
+function nearestGuard() {
+  let best = null;
+  for (const g of guards) {
+    if (!g.alive) continue;
+    const dx = Math.abs(g.x - player.x), dy = Math.abs(g.y - player.y);
+    if (dx < 260 && dy < 20 && (!best || dx < Math.abs(best.x - player.x))) best = g;
+  }
+  return best;
+}
+function playerStrike() {
+  const p = player;
+  for (const g of guards) {
+    if (!g.alive || Math.abs(g.y - p.y) > 20) continue;
+    if (Math.abs(g.x - p.x) <= 66 && (g.x - p.x) * p.dir > 0) {
+      if (Math.random() < 0.3) { g.blkT = 14; spark(g.x - g.dir * 6, g.y - 56); beep(900, .08, 'square'); }
+      else {
+        g.hp--; g.hurtT = 20; g.atkT = 0; beep(240, .12, 'sawtooth', .06);
+        const nx = g.x + p.dir * 10;
+        if (!isWall(nx, g.y - 5) && findFloor(nx, g.y - 1, g.y + 3)) g.x = nx;
+        if (g.hp <= 0) { g.alive = false; say('Guard defeated!', 120); }
+      }
+    }
+  }
+}
+function spark(x, y) { for (let i = 0; i < 8; i++) sparks.push({ x, y, vx: (Math.random() - .5) * 5, vy: -Math.random() * 3, t: 14 }); }
+
+function tryGrab(p) {
+  if (p.noGrab > 0) return false;
+  const d = p.dir, c0 = Math.floor(p.x / TW), hy = p.y - 75;
+  for (let c = c0 - 1; c <= c0 + 1; c++) {
+    const edge = d > 0 ? c * TW : (c + 1) * TW, ahead = (edge - p.x) * d;
+    if (ahead < -6 || ahead > 30) continue;
+    for (let r = 0; r < ROWS; r++) {
+      const s = surf(c, r);
+      if (s === null || Math.abs(s - hy) > 20 || isWallCell(c, r - 1)) continue;
+      p.state = 'hang'; p.vx = p.vy = 0; p.hangT = 0; p.hangS = s;
+      p.x = edge - d * 14; p.y = s + 75;
+      p.hx0 = p.x; p.hx1 = edge + d * 18; beep(300, .05, 'triangle');
+      return true;
+    }
+  }
+  return false;
+}
+
+function land(p, f, mv) {
+  const fall = f.s - p.minY;
+  p.y = f.s; p.vx = 0; p.vy = 0; p.state = 'ground';
+  if (f.ch === '^' && Math.abs(p.x - (f.c * TW + TW / 2)) < 26) return die('Impaled on spikes!  Press Enter');
+  if (fall >= 290) return die('You fell too far!  Press Enter');
+  if (fall >= 205) { hurt(1); say('Ouch! That hurt.', 90); } else if (fall > 130) beep(120, .08, 'triangle');
+}
+
+function updatePlayer() {
+  const p = player;
+  if (p.hurtT > 0) p.hurtT--;
+  if (p.noGrab > 0) p.noGrab--;
+  if (p.state === 'dead' || p.state === 'won') return;
+  const L = keys.left, R = keys.right;
+  let mv = (R ? 1 : 0) - (L ? 1 : 0);
+  const g = p.state === 'ground' ? nearestGuard() : null;
+  p.fight = !!g;
+  if (p.atkT > 0) { p.atkT--; if (p.atkT === 8) playerStrike(); }
+  p.blk = !!(keys.down && p.fight);
+
+  if (p.state === 'ground') {
+    p.run = false; p.crouch = false;
+    if (p.fight) {
+      p.dir = Math.sign(g.x - p.x) || p.dir;
+      if (mv && p.atkT === 0 && !p.blk) {
+        const nx = p.x + mv * 1.3;
+        if (Math.abs(g.x - nx) > 34 || Math.abs(g.x - nx) > Math.abs(g.x - p.x)) moveX(p, mv * 1.3);
+      }
+      if (pressed.space && p.atkT === 0 && !p.blk) { p.atkT = 18; beep(500, .05, 'square'); }
+    } else {
+      p.crouch = keys.down;
+      if (pressed.up && !keys.down) {
+        if (mv) { p.dir = mv; p.vx = mv * 3.4; p.vy = -8.2; } else { p.vx = 0; p.vy = -8.6; }
+        p.state = 'air'; p.minY = p.y; beep(420, .08, 'triangle');
+      } else if (!p.crouch && mv) {
+        p.dir = mv; p.run = true; p.phase += 0.26; moveX(p, mv * 2.8);
+      }
+    }
+    if (p.state === 'ground') {
+      const f = findFloor(p.x, p.y - 1, p.y + 3);
+      if (!f) { p.state = 'air'; p.vx = mv * 2; p.vy = 0; p.minY = p.y; }
+      else {
+        p.y = f.s;
+        const cx = f.c * TW + TW / 2;
+        if (f.ch === '^' && Math.abs(p.x - cx) < 26) return die('Impaled on spikes!  Press Enter');
+        if (f.ch === 'p' && !gateOpen) { gateOpen = true; say('Click! A gate rumbles open somewhere...', 150); beep(110, .4, 'triangle', .07); }
+        if (f.ch === 'E' && Math.abs(p.x - cx) < 22) { p.state = 'won'; game = 'won'; beep(660, .4, 'triangle', .07); return; }
+        for (const it of items) if (!it.taken && Math.abs(it.x - p.x) < 24 && Math.abs(it.y - p.y) < 6 && p.hp < p.maxhp) {
+          it.taken = true; p.hp++; say('You feel better.', 90); beep(700, .15, 'sine', .06);
+        }
+      }
+    }
+  } else if (p.state === 'air') {
+    p.vy = Math.min(p.vy + G, 12);
+    if (p.vx && !moveX(p, p.vx)) p.vx = 0;
+    const ny = p.y + p.vy;
+    if (p.vy > 0) {
+      const f = findFloor(p.x, p.y, ny);
+      if (f) { land(p, f, mv); return; }
+      p.y = ny;
+    } else if (isWall(p.x, ny - 82)) p.vy = 0; else p.y = ny;
+    p.minY = Math.min(p.minY, p.y);
+    if (keys.up && tryGrab(p)) return;
+    if (p.y > ROWS * TH + 200) die('You fell into the abyss!  Press Enter');
+  } else if (p.state === 'hang') {
+    p.hangT++;
+    if (keys.down) { p.state = 'air'; p.vx = 0; p.vy = 0; p.minY = p.y; p.noGrab = 20; p.x -= p.dir * 8; }
+    else if (keys.up && p.hangT > 14) { p.state = 'climb'; p.climbT = 0; }
+  } else if (p.state === 'climb') {
+    p.climbT++;
+    const t = Math.min(1, p.climbT / 26);
+    p.y = p.hangS + 75 * (1 - t); p.x = p.hx0 + (p.hx1 - p.hx0) * t;
+    if (t >= 1) { p.state = 'ground'; p.y = p.hangS; p.minY = p.y; }
+  }
+}
+
+// ---------------------------------------------------------------- guards
+function guardStep(g, sp) {
+  const nx = g.x + g.dir * sp;
+  if (isWall(nx + g.dir * 12, g.y - 5) || !findFloor(nx + g.dir * 14, g.y - 1, g.y + 3)) return;
+  g.x = nx;
+}
+function updateGuard(g) {
+  if (!g.alive) return;
+  if (g.hurtT > 0) g.hurtT--;
+  if (g.blkT > 0) g.blkT--;
+  if (g.cd > 0) g.cd--;
+  if (g.atkT > 0) {
+    g.atkT--;
+    if (g.atkT === 10) {
+      const p = player, dx = p.x - g.x;
+      if (p.state === 'ground' && Math.abs(dx) <= 68 && dx * g.dir > 0 && Math.abs(p.y - g.y) < 20 && p.hurtT === 0) {
+        if (p.blk) { spark(p.x - p.dir * 6, p.y - 56); beep(900, .08, 'square'); } else hurt(1);
+      }
+    }
+  }
+  const p = player, dx = p.x - g.x, dy = p.y - g.y;
+  g.run = false;
+  if (p.state === 'dead' || p.state === 'won' || Math.abs(dy) > 20 || Math.abs(dx) > 380) { g.engaged = false; return; }
+  g.engaged = true; g.dir = Math.sign(dx) || g.dir;
+  if (g.atkT > 0 || g.blkT > 0) return;
+  const dist = Math.abs(dx);
+  if (dist > 64) { guardStep(g, 1.0); g.phase += .2; g.run = true; }
+  else if (dist < 46) guardStep(g, -0.8);
+  else if (g.cd === 0) { g.atkT = 22; g.cd = 45 + (Math.random() * 60 | 0); }
+}
+
+// ---------------------------------------------------------------- update loop
+function update() {
+  frame++;
+  if (msgT > 0 && game === 'play') msgT--;
+  if (game === 'play') {
+    timeLeft -= 1 / 60;
+    if (timeLeft <= 0) { game = 'timeout'; player.state = 'dead'; }
+    updatePlayer(); guards.forEach(updateGuard);
+  }
+  sparks.forEach(s => { s.x += s.vx; s.y += s.vy; s.vy += .3; s.t--; });
+  sparks = sparks.filter(s => s.t > 0);
+  pressed = {};
+}
+
+// ---------------------------------------------------------------- drawing
+const rect = (x, y, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); };
+
+function drawCell(c, r) {
+  const ch = cell(c, r), x = c * TW, y = r * TH, ys = (r + 1) * TH;
+  if (ch === '#') {
+    rect(x, y, TW, TH, '#3b3650');
+    ctx.strokeStyle = '#25213a'; ctx.lineWidth = 2; ctx.beginPath();
+    for (let i = 1; i < 5; i++) {
+      ctx.moveTo(x, y + i * 22); ctx.lineTo(x + TW, y + i * 22);
+      const off = (i % 2) * 32;
+      ctx.moveTo(x + off + 16, y + (i - 1) * 22); ctx.lineTo(x + off + 16, y + i * 22);
+    }
+    ctx.stroke();
+    rect(x, y, TW, 3, '#5d5780');
+  } else if (FLOORISH.includes(ch)) {
+    rect(x, ys - 5, TW, 15, '#5e5680'); rect(x, ys - 5, TW, 3, '#a39bc4'); rect(x + TW - 2, ys - 5, 2, 15, '#3b3650');
+    if (ch === '^') {
+      ctx.fillStyle = '#cfcfe0';
+      for (let k = 0; k < 4; k++) { const sx = x + 8 + k * 13; ctx.beginPath(); ctx.moveTo(sx, ys - 5); ctx.lineTo(sx + 5, ys - 26); ctx.lineTo(sx + 10, ys - 5); ctx.fill(); }
+    }
+    if (ch === 'p') rect(x + 18, ys - (gateOpen ? 6 : 9), 28, gateOpen ? 2 : 4, '#c59a3a');
+    if (ch === 'D') {
+      const h = gateOpen ? 16 : TH - 10;
+      for (let k = 0; k < 6; k++) rect(x + 6 + k * 10, y + 4, 4, h, '#8b8ba0');
+      rect(x + 2, y + 4 + (gateOpen ? 12 : 28), TW - 4, 4, '#6d6d82');
+    }
+    if (ch === 'E') {
+      rect(x + 8, ys - 94, TW - 16, 89, '#12091c');
+      ctx.strokeStyle = '#d8b24a'; ctx.lineWidth = 4; ctx.strokeRect(x + 8, ys - 94, TW - 16, 89);
+      const gr = ctx.createLinearGradient(0, ys - 94, 0, ys - 5); gr.addColorStop(0, 'rgba(255,216,106,0)'); gr.addColorStop(1, 'rgba(255,216,106,.55)');
+      ctx.fillStyle = gr; ctx.fillRect(x + 10, ys - 92, TW - 20, 85);
+    }
+  }
+}
+
+const TORCHES = [[3, 4], [13, 4], [21, 4], [4, 1], [14, 1], [20, 1], [27, 1]];
+function drawTorch(c, r) {
+  const x = c * TW + TW / 2, y = r * TH + 50, f = Math.sin(frame * .4 + c) * 2;
+  rect(x - 2, y, 4, 14, '#6b4a2a');
+  const gr = ctx.createRadialGradient(x, y - 4, 2, x, y - 4, 38);
+  gr.addColorStop(0, 'rgba(255,170,60,.35)'); gr.addColorStop(1, 'rgba(255,170,60,0)');
+  ctx.fillStyle = gr; ctx.fillRect(x - 40, y - 44, 80, 80);
+  ctx.fillStyle = '#ffb347'; ctx.beginPath(); ctx.ellipse(x, y - 5, 5, 9 + f, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#fff2a8'; ctx.beginPath(); ctx.ellipse(x, y - 3, 2.5, 5 + f / 2, 0, 0, 7); ctx.fill();
+}
+
+function drawChar(e, pal) {
+  ctx.save(); ctx.translate(Math.round(e.x), Math.round(e.y)); ctx.scale(e.dir || 1, 1);
+  if (e.hurtT > 0 && Math.floor(e.hurtT / 3) % 2) ctx.globalAlpha = .45;
+  rect(-15, -2, 30, 4, 'rgba(0,0,0,.35)');
+  const s = e.state, dead = s === 'dead' || e.alive === false;
+  const circle = (x, y, r, c) => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); };
+  if (dead) {
+    rect(-38, -11, 28, 10, pal.pants); rect(-12, -13, 28, 12, pal.shirt);
+    circle(22, -9, 8, pal.skin); rect(15, -18, 14, 6, pal.hair);
+  } else {
+    let sw = 0;
+    if (s === 'ground' && e.run) sw = Math.sin(e.phase) * 9;
+    if (s === 'air') sw = 9;
+    const hang = s === 'hang' || s === 'climb';
+    if (e.crouch && !hang) ctx.scale(1, .72);
+    if (hang) ctx.translate(0, 6);
+    rect(-7 + sw, -34, 8, 34, pal.pants); rect(-1 - sw, -34, 8, 34, pal.pants);
+    rect(-7 + sw, -4, 10, 4, '#2a1c14'); rect(-1 - sw, -4, 10, 4, '#2a1c14');
+    rect(-9, -64, 18, 32, pal.shirt); rect(-9, -37, 18, 5, pal.sash);
+    circle(0, -72, 8, pal.skin);
+    if (pal.turban) { ctx.fillStyle = pal.hair; ctx.beginPath(); ctx.ellipse(0, -78, 10, 7, 0, 0, 7); ctx.fill(); }
+    else { rect(-8, -82, 16, 6, pal.hair); rect(-9, -80, 4, 9, pal.hair); }
+    if (hang) {
+      rect(7, -88, 6, 28, pal.skin); rect(11, -90, 9, 5, pal.skin);
+    } else if (e.fight || e.engaged) {
+      rect(2, -58, 24, 5, pal.skin);
+      ctx.strokeStyle = '#e6e6ff'; ctx.lineWidth = 3; ctx.beginPath();
+      if (e.blk) { ctx.moveTo(24, -56); ctx.lineTo(32, -102); }
+      else if (e.atkT > 0) { const ext = Math.sin((1 - e.atkT / (e.alive === undefined ? 18 : 22)) * Math.PI); ctx.moveTo(26, -56); ctx.lineTo(30 + 40 * ext, -58 - 4 * ext); }
+      else { ctx.moveTo(26, -56); ctx.lineTo(54, -78); }
+      ctx.stroke();
+    } else { rect(-3 - sw / 3, -60, 6, 24, pal.skin); }
+  }
+  ctx.restore();
+}
+const PRINCE = { skin: '#e3b48c', shirt: '#f1f1f6', pants: '#d6d6ea', sash: '#c0302e', hair: '#1c1410', turban: false };
+const GUARD = { skin: '#c99a72', shirt: '#8a2c2c', pants: '#2a3a8c', sash: '#d8b24a', hair: '#e8d9a0', turban: true };
+
+function draw() {
+  const p = player;
+  const rx = Math.min(2, Math.max(0, Math.floor(p.x / (RW * TW))));
+  const ry = Math.min(1, Math.max(0, Math.floor((p.y - 78) / (RH * TH))));
+  const ox = rx * RW * TW, oy = ry * RH * TH;
+  rect(0, 0, W, H, '#07060d');
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, VIEW_H); ctx.clip();
+  ctx.translate(-ox, -oy);
+  rect(ox, oy, RW * TW, RH * TH + 20, '#171428');
+  ctx.strokeStyle = '#1f1b36'; ctx.lineWidth = 2; ctx.beginPath();
+  for (let y = oy; y < oy + RH * TH + 20; y += 22) {
+    ctx.moveTo(ox, y); ctx.lineTo(ox + RW * TW, y);
+    for (let x = ox + ((y / 22) % 2) * 32; x < ox + RW * TW; x += 64) { ctx.moveTo(x, y); ctx.lineTo(x, y + 22); }
+  }
+  ctx.stroke();
+  TORCHES.forEach(([c, r]) => { if (c >= rx * RW && c < rx * RW + RW && r >= ry * RH && r < ry * RH + RH) drawTorch(c, r); });
+  for (let r = ry * RH; r < ry * RH + RH; r++) for (let c = rx * RW; c < rx * RW + RW; c++) drawCell(c, r);
+  // potions
+  for (const it of items) if (!it.taken) {
+    const b = Math.sin(frame * .1) * 1.5;
+    rect(it.x - 6, it.y - 18 + b, 12, 12, '#d8213a'); rect(it.x - 3, it.y - 24 + b, 6, 6, '#c8c8d8');
+  }
+  guards.forEach(g => drawChar(g, GUARD));
+  drawChar(p, PRINCE);
+  for (const s of sparks) rect(s.x, s.y, 3, 3, '#ffe38a');
+  ctx.restore();
+  drawHUD();
+  if (game !== 'play') drawOverlay();
+}
+
+function drawHUD() {
+  rect(0, VIEW_H, W, H - VIEW_H, '#000');
+  for (let i = 0; i < player.maxhp; i++) {
+    ctx.fillStyle = i < player.hp ? '#e23a3a' : '#3a1a1a';
+    ctx.beginPath(); ctx.moveTo(12 + i * 24, VIEW_H + 24); ctx.lineTo(28 + i * 24, VIEW_H + 24); ctx.lineTo(20 + i * 24, VIEW_H + 8); ctx.fill();
+  }
+  ctx.font = '13px monospace'; ctx.textAlign = 'center'; ctx.fillStyle = '#cbb98a';
+  if (msgT > 0 || game !== 'play') ctx.fillText(msg, W / 2, VIEW_H + 21);
+  else { const m = Math.max(0, Math.ceil(timeLeft / 60)); ctx.fillText(m + ' minutes left', W / 2, VIEW_H + 21); }
+  const g = nearestGuard();
+  if (g) for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < g.hp ? '#8a5ae2' : '#241a3a';
+    ctx.beginPath(); ctx.moveTo(W - 100 + i * 24, VIEW_H + 24); ctx.lineTo(W - 84 + i * 24, VIEW_H + 24); ctx.lineTo(W - 92 + i * 24, VIEW_H + 8); ctx.fill();
+  }
+}
+
+function drawOverlay() {
+  rect(0, 0, W, VIEW_H, 'rgba(5,3,12,.72)');
+  ctx.textAlign = 'center'; ctx.fillStyle = '#ffd86a'; ctx.font = 'bold 38px serif';
+  const big = { title: 'PRINCE OF PERSIA', dead: 'YOU DIED', won: 'ESCAPED!', timeout: 'TIME IS UP' }[game];
+  ctx.fillText(big, W / 2, 130);
+  ctx.font = '15px monospace'; ctx.fillStyle = '#cbb98a';
+  if (game === 'title') {
+    ctx.fillText('Escape the dungeon before the sixty minutes run out.', W / 2, 175);
+    ctx.fillText('Arrows / WASD to move, Space to fight.', W / 2, 200);
+    ctx.fillText('Press Enter to begin', W / 2, 245);
+  } else if (game === 'won') {
+    ctx.fillText('Minutes remaining: ' + Math.ceil(timeLeft / 60), W / 2, 180);
+    ctx.fillText('Press Enter to play again', W / 2, 225);
+  } else ctx.fillText('Press Enter to ' + (game === 'timeout' ? 'start over' : 'try again'), W / 2, 200);
+}
+
+// ---------------------------------------------------------------- input / loop
+const MAP = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right', ArrowUp: 'up', KeyW: 'up',
+  ArrowDown: 'down', KeyS: 'down', Space: 'space', KeyZ: 'space' };
+addEventListener('keydown', e => {
+  const k = MAP[e.code];
+  if (k) { e.preventDefault(); if (!keys[k]) pressed[k] = true; keys[k] = true; }
+  if ((e.code === 'Enter' || (e.code === 'KeyR' && game !== 'title')) && game !== 'play') {
+    reset(game === 'title' || game === 'won' || game === 'timeout'); game = 'play';
+  }
+  if (e.code === 'KeyR' && game === 'play') reset(false);
+  beep(1, .01, 'sine', 0.0001); // unlock audio context
+});
+addEventListener('keyup', e => { const k = MAP[e.code]; if (k) keys[k] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+reset(true);
+let last = performance.now(), acc = 0;
+function loop(now) {
+  acc += Math.min(100, now - last); last = now;
+  while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+  draw(); requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+window.__pop = { get player() { return player; }, get guards() { return guards; }, get game() { return game; }, keys };
+</script>
+</body>
+</html>
